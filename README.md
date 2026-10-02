@@ -111,6 +111,26 @@ Os modelos são configurados na pasta `models/` e consumidos pelo container Dock
 
 ---
 
+## 📁 Estrutura do Projeto
+
+A base de código adota uma arquitetura em camadas modular e desacoplada:
+
+```text
+smart-llm-router/
+├── src/smart_router/
+│   ├── domain/           # Entidades, enums e contratos de domínio
+│   ├── config/           # Gestão tipada de configurações e ambiente (Settings)
+│   ├── infrastructure/   # Gerenciamento de VRAM, indexação vetorial (FAISS HNSW) e cliente LLM
+│   ├── application/      # Serviços de roteamento rápido, triagem epistêmica e orquestração
+│   └── presentation/     # Renderizador de console ANSI e interface CLI
+├── tests/                # Suíte de testes unitários automatizados
+├── models/               # Manifestos de configuração e pesos GGUF
+├── docker-compose.yml    # Orquestração do servidor LocalAI em container
+└── smart_router.py       # Ponto de entrada e compatibilidade da aplicação
+```
+
+---
+
 ## 📦 Instalação e Pré-requisitos
 
 ### 📋 Requisitos do Sistema
