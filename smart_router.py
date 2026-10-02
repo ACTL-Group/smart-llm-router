@@ -14,7 +14,7 @@ import requests
 
 load_dotenv()
 
-# ANSI Colors
+# Estilos e Cores ANSI
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -43,6 +43,22 @@ LOGPROB_THRESHOLD = float(os.getenv("ROUTER_LOGPROB_THRESHOLD", "-0.80"))
 client = OpenAI(base_url=OPENAI_BASE_URL, api_key=API_KEY)
 
 
+def log_step(title: str, detail: str = ""):
+    print(f"\n{BLUE}{BOLD}┌── [ETAPA: {title}]{RESET}")
+    if detail:
+        print(f"{BLUE}│{RESET}  {detail}")
+
+
+def log_sub(text: str):
+    print(f"{BLUE}│{RESET}  {text}")
+
+
+def log_end(summary: str = ""):
+    if summary:
+        print(f"{BLUE}│{RESET}  {GREEN}✔ {summary}{RESET}")
+    print(f"{BLUE}└──{RESET}")
+
+
 class DynamicVRAMManager:
 
     def __init__(self, base_url: str, container_name: str = "dynamic-llama-server"):
@@ -51,6 +67,7 @@ class DynamicVRAMManager:
         self.current_model: str | None = None
 
     def purge_all(self):
+        log_sub("Limpando memória de GPU e processos gRPC órfãos no container...")
         for ep in ["/backend/shutdown", "/backend/stop", "/models/unload"]:
             try:
                 requests.post(
@@ -71,6 +88,7 @@ class DynamicVRAMManager:
         time.sleep(1.0)
 
     def force_purge_model(self, model_name: str):
+        log_sub(f"Desalocando modelo anterior '{model_name}' da VRAM...")
         for ep in ["/backend/shutdown", "/backend/stop", "/models/unload"]:
             try:
                 requests.post(
@@ -91,13 +109,13 @@ class DynamicVRAMManager:
 
     def switch_to(self, model_name: str):
         if self.current_model == model_name:
+            log_sub(f"Modelo '{model_name}' já está aquecido na GPU. Reutilizando contexto.")
             return
 
         if self.current_model is not None:
-            print(f"{DIM}[VRAM] Desalocando {self.current_model} da GPU...{RESET}")
             self.force_purge_model(self.current_model)
 
-        print(f"{DIM}[VRAM] Carregando {model_name} na GPU...{RESET}")
+        log_sub(f"Carregando pesos de '{model_name}' para a VRAM via LocalAI...")
         self.current_model = model_name
 
     @contextmanager
@@ -108,8 +126,9 @@ class DynamicVRAMManager:
 
 vram = DynamicVRAMManager(BASE_API_URL)
 
-# Limpeza no start
+log_step("INICIALIZAÇÃO DO AMBIENTE", "Garantindo que a GPU comece vazia")
 vram.purge_all()
+log_end("VRAM zerada")
 
 
 def cleanup():
@@ -120,7 +139,7 @@ atexit.register(cleanup)
 
 
 def handle_sigint(sig, frame):
-    print(f"\n{YELLOW}Encerrando aplicação e limpando VRAM...{RESET}")
+    print(f"\n{YELLOW}Interrupção detectada. Ejetando modelos da GPU antes de sair...{RESET}")
     cleanup()
     sys.exit(0)
 
@@ -148,7 +167,8 @@ def get_embedding(text: str) -> np.ndarray:
 
 
 def init_hnsw_index():
-    print(f"{DIM}[INIT] Construindo índice semântico HNSW com {len(CALIBRATION_SET)} amostras...{RESET}")
+    log_step("INDEXAÇÃO HNSW", f"Calibrando espaço vetorial com {len(CALIBRATION_SET)} intenções de referência")
+    t0 = time.time()
     vectors_list = []
     labels_list = []
 
@@ -164,14 +184,18 @@ def init_hnsw_index():
     index = faiss.IndexHNSWFlat(dim, 16, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efSearch = 32
     index.add(vectors)
-    print(f"{GREEN}[INIT] Índice pronto para inferência.{RESET}\n")
+    elapsed = time.time() - t0
+    log_sub(f"Dimensão vetorial: {dim}D | Métrica: Cosine Distance (via Inner Product)")
+    log_end(f"Grafo HNSW pronto em {elapsed:.2f}s")
     return index, labels
 
 
 HNSW_INDEX, TRAIN_LABELS = init_hnsw_index()
 
 
-def evaluate_slm_uncertainty(query: str) -> int:
+def evaluate_slm_uncertainty(query: str) -> tuple[int, str]:
+    log_step("FALLBACK EPISTÊMICO (SLM)", "Margem de embeddings ambígua. Avaliando incerteza probabilística com SLM.")
+    t0 = time.time()
     with vram.session(MODEL_CHEAP):
         resp = client.chat.completions.create(
             model=MODEL_CHEAP,
@@ -193,40 +217,70 @@ def evaluate_slm_uncertainty(query: str) -> int:
         for item in (choice.logprobs.content or [])
         if item.logprob is not None
     ]
+    raw_text = (choice.message.content or "").strip()
+    elapsed = time.time() - t0
 
-    if not token_logprobs or "[CRITICO]" in (choice.message.content or ""):
-        return 1
+    if not token_logprobs:
+        log_sub(f"Sem logprobs retornados. Forçando rota de segurança para Crítico ({elapsed:.2f}s).")
+        log_end()
+        return 1, "Fallback: Sem logprobs (Fail-safe)"
 
     avg_logprob = sum(token_logprobs) / len(token_logprobs)
-    return 1 if avg_logprob < LOGPROB_THRESHOLD else 0
+    log_sub(f"Classificação gerada: '{raw_text}'")
+    log_sub(f"Logprob médio: {avg_logprob:.4f} (Limiar de corte: {LOGPROB_THRESHOLD})")
+
+    if "[CRITICO]" in raw_text or avg_logprob < LOGPROB_THRESHOLD:
+        target = 1
+        motivo = "Incerteza alta do SLM ou tag [CRITICO]"
+    else:
+        target = 0
+        motivo = "Confiança alta do SLM em [SIMPLES]"
+
+    log_end(f"Resultado do SLM: {motivo} em {elapsed:.2f}s")
+    return target, f"Gated SLM (AvgLogprob: {avg_logprob:.2f})"
 
 
 def route_query(query: str) -> tuple[int, str]:
+    log_step("VETORIZAÇÃO E BUSCA SEMÂNTICA", f"Convertendo prompt para embedding via '{MODEL_EMBED}'")
+    t0 = time.time()
     q_vec = get_embedding(query)
+    log_sub(f"Vetor gerado e normalizado em {time.time() - t0:.2f}s")
 
+    log_sub("Consultando os k=3 vizinhos mais próximos no grafo HNSW...")
     dists, idxs = HNSW_INDEX.search(np.expand_dims(q_vec, axis=0), k=3)
     labels = TRAIN_LABELS[idxs[0]]
     weights = dists[0]
+
+    for rank, (idx, score, lbl) in enumerate(zip(idxs[0], weights, labels), 1):
+        lbl_str = "Crítico" if lbl == 1 else "Simples"
+        ref_text = CALIBRATION_SET[idx][0]
+        log_sub(f"  #{rank} [Score: {score:.3f}] [{lbl_str}] \"{ref_text}\"")
 
     score_0 = float(np.sum(weights[labels == 0]))
     score_1 = float(np.sum(weights[labels == 1]))
     margin = abs(score_0 - score_1) / (max(score_0, score_1) + 1e-6)
 
+    log_sub(f"Score Simples (0): {score_0:.3f} | Score Crítico (1): {score_1:.3f}")
+    log_sub(f"Margem de confiança calculada: {margin:.4f} (Threshold mínimo: {MARGIN_THRESHOLD})")
+
     if margin >= MARGIN_THRESHOLD:
         target = 1 if score_1 >= score_0 else 0
+        tipo = "Crítico" if target == 1 else "Simples"
+        log_end(f"Fast-Path HNSW determinou rota '{tipo}' com margem {margin:.2f}")
         return target, f"Fast-Path HNSW (Margem: {margin:.2f})"
 
-    target = evaluate_slm_uncertainty(query)
-    return target, f"Gated Epistemic Fallback (Margem: {margin:.2f})"
+    log_sub("Margem abaixo do threshold. O classificador semântico está incerto.")
+    log_end()
+    return evaluate_slm_uncertainty(query)
 
 
-def render_message(role: str, content: str, meta: str = ""):
+def render_chat_turn(role: str, content: str, meta: str = ""):
     divider = "─" * 70
     if role == "user":
         header = f"{CYAN}{BOLD}🧑 Você{RESET}"
         text_color = CYAN
     elif role == "system":
-        header = f"{YELLOW}{BOLD}⚙️  Sistema (Prompt de Contexto){RESET}"
+        header = f"{YELLOW}{BOLD}⚙️  Prompt de Sistema Injetado{RESET}"
         text_color = DIM
     else:
         model_badge = f"{MAGENTA}[{meta}]{RESET}" if meta else ""
@@ -236,49 +290,43 @@ def render_message(role: str, content: str, meta: str = ""):
     print(f"\n{header}")
     print(f"{DIM}{divider}{RESET}")
     print(f"{text_color}{content.strip()}{RESET}")
-    print(f"{DIM}{divider}{RESET}")
+    print(f"{DIM}{divider}{RESET}\n")
 
 
 def dispatch(query: str):
-    # 1. Mensagem do usuário
-    render_message("user", query)
+    # Renderiza entrada do usuário estilo ChatGPT
+    render_chat_turn("user", query)
 
-    # 2. Roteamento
+    # Executa o pipeline de roteamento
     target, path_info = route_query(query)
     model_name = MODEL_CHEAP if target == 0 else MODEL_EXPENSIVE
-    badge_label = "🟢 Simples / Econômico" if target == 0 else "🔴 Crítico / Especializado"
+    badge_label = "🟢 Simples / Econômico" if target == 0 else "🔴 Crítico / Alta Capacidade"
 
-    print(f"{BLUE}↳ Decisão de Roteamento:{RESET} {badge_label} | {DIM}{path_info}{RESET}")
+    print(f"\n{BOLD}⚡ DECISÃO FINAL DE ROTEAMENTO:{RESET} {badge_label}")
+    print(f"{DIM}Modelo selecionado: {model_name} | Origem: {path_info}{RESET}")
 
     if target == 0:
         system_prompt = "Você é um assistente de suporte operacional para dúvidas simples."
-        render_message("system", system_prompt)
-
-        with vram.session(MODEL_CHEAP):
-            resp = client.chat.completions.create(
-                model=MODEL_CHEAP,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": query},
-                ],
-                temperature=0.2,
-            )
-        render_message("assistant", resp.choices[0].message.content or "", meta=MODEL_CHEAP)
-
     else:
-        system_prompt = "Atendimento especializado em segurança, fraudes e ocorrências críticas."
-        render_message("system", system_prompt)
+        system_prompt = "Atendimento especializado em segurança, fraudes e ocorrências financeiras críticas."
 
-        with vram.session(MODEL_EXPENSIVE):
-            resp = client.chat.completions.create(
-                model=MODEL_EXPENSIVE,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": query},
-                ],
-                temperature=0.3,
-            )
-        render_message("assistant", resp.choices[0].message.content or "", meta=MODEL_EXPENSIVE)
+    render_chat_turn("system", system_prompt)
+
+    log_step("GERAÇÃO DE RESPOSTA", f"Enviando contexto para inferência com '{model_name}'")
+    t0 = time.time()
+    with vram.session(model_name):
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query},
+            ],
+            temperature=0.2 if target == 0 else 0.3,
+        )
+    elapsed = time.time() - t0
+    log_end(f"Resposta gerada em {elapsed:.2f}s")
+
+    render_chat_turn("assistant", resp.choices[0].message.content or "", meta=model_name)
 
 
 if __name__ == "__main__":
@@ -287,12 +335,13 @@ if __name__ == "__main__":
         "Transferiram R$ 5.000 da minha conta por Pix e não fui eu.",
     ]
 
-    print(f"{BOLD}=== Executando Queries de Teste ==={RESET}")
+    print(f"{BOLD}=== INICIANDO BATERIA DE TESTES AUTOMATIZADOS ==={RESET}")
     for q in test_queries:
         dispatch(q)
+        print("=" * 80)
 
-    # Modo Interativo estilo chat
-    print(f"\n{BOLD}=== Modo Chat Ativo (Digite 'sair' para encerrar) ==={RESET}")
+    # Modo chat interativo contínuo
+    print(f"\n{BOLD}=== TERMINAL DE CHAT INTERATIVO (Digite 'sair' para encerrar) ==={RESET}")
     while True:
         try:
             user_input = input(f"\n{CYAN}{BOLD}Mensagem > {RESET}").strip()
@@ -304,4 +353,4 @@ if __name__ == "__main__":
         except (KeyboardInterrupt, EOFError):
             break
 
-    print(f"\n{YELLOW}Saindo...{RESET}")
+    print(f"\n{YELLOW}Desligando...{RESET}")
