@@ -2,6 +2,13 @@
 
 > Roteador semântico híbrido e adaptativo para otimização de recursos computacionais e inferência de LLMs locais. Combina busca vetorial aproximada em grafos (HNSW com FAISS), inspeção epistêmica por incerteza (logprobs) em SLM e gerenciamento dinâmico de VRAM no LocalAI via Docker.
 
+
+
+
+https://github.com/user-attachments/assets/3d0512ab-9443-4bac-a0c9-c2d0cfb4a2df
+
+
+
 ---
 
 ## 📌 Visão Geral e Maximização de Utilidade
