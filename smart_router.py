@@ -1,4 +1,7 @@
 from contextlib import contextmanager
+import sys
+import signal
+import subprocess
 import os
 import time
 from dotenv import load_dotenv
@@ -7,6 +10,7 @@ import faiss
 import numpy as np
 from openai import OpenAI
 import requests
+import atexit
 
 load_dotenv()
 
@@ -39,30 +43,47 @@ class DynamicVRAMManager:
         self.container_name = container_name
         self.current_model: str | None = None
 
-    def force_purge_model(self, model_name: str):
-        """Força o encerramento do backend e mata processos gRPC órfãos no container."""
-        # 1. Tenta a API padrão do LocalAI
-        endpoints = ["/backend/shutdown", "/backend/stop", "/models/unload"]
-        for ep in endpoints:
+    def purge_all(self):
+        """Mata todos os backends LLM ativos no container liberando 100% da VRAM."""
+        for ep in ["/backend/shutdown", "/backend/stop", "/models/unload"]:
             try:
                 requests.post(
                     f"{self.base_url}{ep}",
-                    json={"backend": model_name, "model": model_name, "id": model_name},
-                    timeout=5,
+                    json={"all": True},
+                    timeout=3,
                 )
             except requests.RequestException:
                 pass
 
-        # 2. Se o backend C++ continuar preso na VRAM, mata o processo correspondente no container
         try:
-            # Mata os workers llama-cpp associados ao modelo anterior
+            # Mata os binários do llama-cpp que seguram a GPU, preservando o LocalAI principal
+            cmd = f"docker exec {self.container_name} pkill -f 'llama-cpp' || true"
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        self.current_model = None
+        time.sleep(1.0)
+
+    def force_purge_model(self, model_name: str):
+        """Descarrega um modelo específico."""
+        for ep in ["/backend/shutdown", "/backend/stop", "/models/unload"]:
+            try:
+                requests.post(
+                    f"{self.base_url}{ep}",
+                    json={"backend": model_name, "model": model_name, "id": model_name},
+                    timeout=3,
+                )
+            except requests.RequestException:
+                pass
+
+        try:
             cmd = f"docker exec {self.container_name} pkill -f '{model_name}' || true"
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
 
-        # Tempo para o driver NVIDIA desalocar buffers CUDA
-        time.sleep(1.5)
+        time.sleep(1.2)
 
     def switch_to(self, model_name: str):
         if self.current_model == model_name:
@@ -80,6 +101,19 @@ class DynamicVRAMManager:
 
 
 vram = DynamicVRAMManager(BASE_API_URL)
+vram.purge_all()
+
+def cleanup():
+    vram.purge_all()
+
+atexit.register(cleanup)
+
+def handle_sigint(sig, frame):
+    cleanup()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_sigint)
+signal.signal(signal.SIGTERM, handle_sigint)
 
 CALIBRATION_SET = [
     ("Qual o horário de funcionamento das agências?", 0),
