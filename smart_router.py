@@ -1,8 +1,9 @@
+import atexit
 from contextlib import contextmanager
-import sys
+import os
 import signal
 import subprocess
-import os
+import sys
 import time
 from dotenv import load_dotenv
 # noinspection PyPackageRequirements
@@ -10,9 +11,18 @@ import faiss
 import numpy as np
 from openai import OpenAI
 import requests
-import atexit
 
 load_dotenv()
+
+# ANSI Colors
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
+BLUE = "\033[34m"
 
 SERVER_URL = os.getenv("LLAMA_SERVER_URL", "http://localhost:8080").rstrip("/")
 if SERVER_URL.endswith("/v1"):
@@ -23,7 +33,6 @@ else:
     OPENAI_BASE_URL = f"{SERVER_URL}/v1"
 
 API_KEY = os.getenv("API_KEY", "local-no-key")
-
 MODEL_EMBED = os.getenv("MODEL_EMBED", "text-embedding")
 MODEL_CHEAP = os.getenv("MODEL_CHEAP", "bonsai-27b")
 MODEL_EXPENSIVE = os.getenv("MODEL_EXPENSIVE", "qwen-27b")
@@ -34,8 +43,6 @@ LOGPROB_THRESHOLD = float(os.getenv("ROUTER_LOGPROB_THRESHOLD", "-0.80"))
 client = OpenAI(base_url=OPENAI_BASE_URL, api_key=API_KEY)
 
 
-import subprocess
-
 class DynamicVRAMManager:
 
     def __init__(self, base_url: str, container_name: str = "dynamic-llama-server"):
@@ -44,7 +51,6 @@ class DynamicVRAMManager:
         self.current_model: str | None = None
 
     def purge_all(self):
-        """Mata todos os backends LLM ativos no container liberando 100% da VRAM."""
         for ep in ["/backend/shutdown", "/backend/stop", "/models/unload"]:
             try:
                 requests.post(
@@ -56,7 +62,6 @@ class DynamicVRAMManager:
                 pass
 
         try:
-            # Mata os binários do llama-cpp que seguram a GPU, preservando o LocalAI principal
             cmd = f"docker exec {self.container_name} pkill -f 'llama-cpp' || true"
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
@@ -66,7 +71,6 @@ class DynamicVRAMManager:
         time.sleep(1.0)
 
     def force_purge_model(self, model_name: str):
-        """Descarrega um modelo específico."""
         for ep in ["/backend/shutdown", "/backend/stop", "/models/unload"]:
             try:
                 requests.post(
@@ -90,8 +94,10 @@ class DynamicVRAMManager:
             return
 
         if self.current_model is not None:
+            print(f"{DIM}[VRAM] Desalocando {self.current_model} da GPU...{RESET}")
             self.force_purge_model(self.current_model)
 
+        print(f"{DIM}[VRAM] Carregando {model_name} na GPU...{RESET}")
         self.current_model = model_name
 
     @contextmanager
@@ -101,16 +107,23 @@ class DynamicVRAMManager:
 
 
 vram = DynamicVRAMManager(BASE_API_URL)
+
+# Limpeza no start
 vram.purge_all()
+
 
 def cleanup():
     vram.purge_all()
 
+
 atexit.register(cleanup)
 
+
 def handle_sigint(sig, frame):
+    print(f"\n{YELLOW}Encerrando aplicação e limpando VRAM...{RESET}")
     cleanup()
     sys.exit(0)
+
 
 signal.signal(signal.SIGINT, handle_sigint)
 signal.signal(signal.SIGTERM, handle_sigint)
@@ -135,6 +148,7 @@ def get_embedding(text: str) -> np.ndarray:
 
 
 def init_hnsw_index():
+    print(f"{DIM}[INIT] Construindo índice semântico HNSW com {len(CALIBRATION_SET)} amostras...{RESET}")
     vectors_list = []
     labels_list = []
 
@@ -150,6 +164,7 @@ def init_hnsw_index():
     index = faiss.IndexHNSWFlat(dim, 16, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efSearch = 32
     index.add(vectors)
+    print(f"{GREEN}[INIT] Índice pronto para inferência.{RESET}\n")
     return index, labels
 
 
@@ -199,49 +214,71 @@ def route_query(query: str) -> tuple[int, str]:
 
     if margin >= MARGIN_THRESHOLD:
         target = 1 if score_1 >= score_0 else 0
-        return target, f"Fast-Path HNSW (Margin: {margin:.2f})"
+        return target, f"Fast-Path HNSW (Margem: {margin:.2f})"
 
     target = evaluate_slm_uncertainty(query)
-    return target, f"Gated Epistemic Fallback (Margin: {margin:.2f})"
+    return target, f"Gated Epistemic Fallback (Margem: {margin:.2f})"
 
 
-def dispatch(query: str) -> str:
+def render_message(role: str, content: str, meta: str = ""):
+    divider = "─" * 70
+    if role == "user":
+        header = f"{CYAN}{BOLD}🧑 Você{RESET}"
+        text_color = CYAN
+    elif role == "system":
+        header = f"{YELLOW}{BOLD}⚙️  Sistema (Prompt de Contexto){RESET}"
+        text_color = DIM
+    else:
+        model_badge = f"{MAGENTA}[{meta}]{RESET}" if meta else ""
+        header = f"{GREEN}{BOLD}🤖 Assistente {model_badge}{RESET}"
+        text_color = RESET
+
+    print(f"\n{header}")
+    print(f"{DIM}{divider}{RESET}")
+    print(f"{text_color}{content.strip()}{RESET}")
+    print(f"{DIM}{divider}{RESET}")
+
+
+def dispatch(query: str):
+    # 1. Mensagem do usuário
+    render_message("user", query)
+
+    # 2. Roteamento
     target, path_info = route_query(query)
+    model_name = MODEL_CHEAP if target == 0 else MODEL_EXPENSIVE
+    badge_label = "🟢 Simples / Econômico" if target == 0 else "🔴 Crítico / Especializado"
+
+    print(f"{BLUE}↳ Decisão de Roteamento:{RESET} {badge_label} | {DIM}{path_info}{RESET}")
 
     if target == 0:
+        system_prompt = "Você é um assistente de suporte operacional para dúvidas simples."
+        render_message("system", system_prompt)
+
         with vram.session(MODEL_CHEAP):
             resp = client.chat.completions.create(
                 model=MODEL_CHEAP,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "Você é um assistente de suporte operacional para dúvidas simples.",
-                    },
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": query},
                 ],
                 temperature=0.2,
             )
-        return (
-            f"[Rota: Barato Local ({MODEL_CHEAP}) | Caminho: {path_info}]\n"
-            f"{resp.choices[0].message.content}"
-        )
+        render_message("assistant", resp.choices[0].message.content or "", meta=MODEL_CHEAP)
 
-    with vram.session(MODEL_EXPENSIVE):
-        resp = client.chat.completions.create(
-            model=MODEL_EXPENSIVE,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Atendimento especializado em segurança, fraudes e ocorrências críticas.",
-                },
-                {"role": "user", "content": query},
-            ],
-            temperature=0.3,
-        )
-    return (
-        f"[Rota: Caro Local ({MODEL_EXPENSIVE}) | Caminho: {path_info}]\n"
-        f"{resp.choices[0].message.content}"
-    )
+    else:
+        system_prompt = "Atendimento especializado em segurança, fraudes e ocorrências críticas."
+        render_message("system", system_prompt)
+
+        with vram.session(MODEL_EXPENSIVE):
+            resp = client.chat.completions.create(
+                model=MODEL_EXPENSIVE,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.3,
+            )
+        render_message("assistant", resp.choices[0].message.content or "", meta=MODEL_EXPENSIVE)
 
 
 if __name__ == "__main__":
@@ -250,7 +287,21 @@ if __name__ == "__main__":
         "Transferiram R$ 5.000 da minha conta por Pix e não fui eu.",
     ]
 
+    print(f"{BOLD}=== Executando Queries de Teste ==={RESET}")
     for q in test_queries:
-        print(f"Query: {q}")
-        print(dispatch(q))
-        print("=" * 60)
+        dispatch(q)
+
+    # Modo Interativo estilo chat
+    print(f"\n{BOLD}=== Modo Chat Ativo (Digite 'sair' para encerrar) ==={RESET}")
+    while True:
+        try:
+            user_input = input(f"\n{CYAN}{BOLD}Mensagem > {RESET}").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ("sair", "exit", "quit"):
+                break
+            dispatch(user_input)
+        except (KeyboardInterrupt, EOFError):
+            break
+
+    print(f"\n{YELLOW}Saindo...{RESET}")
