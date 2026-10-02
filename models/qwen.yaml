@@ -1,0 +1,4 @@
+name: qwen-27b
+backend: llama-cpp
+parameters:
+  model: qwen-27b.gguf

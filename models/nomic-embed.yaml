@@ -1,0 +1,11 @@
+name: text-embedding
+backend: llama-cpp
+type: embeddings
+embeddings: true
+parallel: 1
+slots: 1
+parameters:
+  model: nomic-embed.gguf
+  embeddings: true
+  n_ctx: 2048
+  batch: 512

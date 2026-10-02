@@ -1,0 +1,27 @@
+services:
+  llama-server:
+    image: localai/localai:latest-gpu-nvidia-cuda-12
+    container_name: dynamic-llama-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models
+      # Se usar symlink apontando para /mnt/storage_one, mantenha esta linha:
+      - /mnt/storage_one/llm_models:/mnt/storage_one/llm_models:ro
+      - localai_backends:/backends
+    environment:
+      - DEBUG=true
+      - THREADS=8
+      - CONTEXT_SIZE=4096
+      - REBUILD=false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  localai_backends:

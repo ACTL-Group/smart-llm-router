@@ -1,0 +1,4 @@
+name: bonsai-27b
+backend: llama-cpp
+parameters:
+  model: bonsai-27b.gguf
