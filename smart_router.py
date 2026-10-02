@@ -30,26 +30,46 @@ LOGPROB_THRESHOLD = float(os.getenv("ROUTER_LOGPROB_THRESHOLD", "-0.80"))
 client = OpenAI(base_url=OPENAI_BASE_URL, api_key=API_KEY)
 
 
+import subprocess
+
 class DynamicVRAMManager:
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, container_name: str = "dynamic-llama-server"):
         self.base_url = base_url
+        self.container_name = container_name
         self.current_model: str | None = None
+
+    def force_purge_model(self, model_name: str):
+        """Força o encerramento do backend e mata processos gRPC órfãos no container."""
+        # 1. Tenta a API padrão do LocalAI
+        endpoints = ["/backend/shutdown", "/backend/stop", "/models/unload"]
+        for ep in endpoints:
+            try:
+                requests.post(
+                    f"{self.base_url}{ep}",
+                    json={"backend": model_name, "model": model_name, "id": model_name},
+                    timeout=5,
+                )
+            except requests.RequestException:
+                pass
+
+        # 2. Se o backend C++ continuar preso na VRAM, mata o processo correspondente no container
+        try:
+            # Mata os workers llama-cpp associados ao modelo anterior
+            cmd = f"docker exec {self.container_name} pkill -f '{model_name}' || true"
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        # Tempo para o driver NVIDIA desalocar buffers CUDA
+        time.sleep(1.5)
 
     def switch_to(self, model_name: str):
         if self.current_model == model_name:
             return
 
         if self.current_model is not None:
-            try:
-                requests.post(
-                    f"{self.base_url}/models/unload",
-                    json={"model": self.current_model},
-                    timeout=15,
-                )
-            except requests.RequestException:
-                pass
-            time.sleep(1.0)
+            self.force_purge_model(self.current_model)
 
         self.current_model = model_name
 
